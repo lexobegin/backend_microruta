@@ -1,0 +1,258 @@
+"""
+Servicio para clculo de rutas optimas usando algoritmo de Dijkstra
+Implementacion adaptada para red de transporte publico
+"""
+
+import heapq
+from typing import List, Dict, Tuple, Optional
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from geoalchemy2.functions import ST_Distance, ST_Transform
+from ..models import Punto, LineaRutaPunto, Transferencia, Ruta, Linea
+
+class NodoTransporte:
+    """Representa un nodo en la red de transporte"""
+    def __init__(self, punto_id: int, ruta_id: Optional[int] = None):
+        self.punto_id = punto_id
+        self.ruta_id = ruta_id  # Ruta actual (None si es punto de transferencia)
+        
+    def __lt__(self, other):
+        # Para usar en heap
+        return self.punto_id < other.punto_id
+
+class CalculadorRutas:
+    def __init__(self, db: Session):
+        self.db = db
+        self.graph = {}  # Grafo para Dijkstra
+        self._build_graph()
+    
+    def _build_graph(self):
+        """Construye el grafo de transporte público"""
+        # Obtener todos los puntos de ruta
+        puntos_ruta = self.db.query(LineaRutaPunto).all()
+        
+        for pr in puntos_ruta:
+            # Nodo actual
+            nodo_actual = NodoTransporte(pr.punto_id, pr.ruta_id)
+            
+            # Buscar el siguiente punto en la misma ruta
+            siguiente = self.db.query(LineaRutaPunto).filter(
+                LineaRutaPunto.ruta_id == pr.ruta_id,
+                LineaRutaPunto.orden == pr.orden + 1
+            ).first()
+            
+            if siguiente:
+                # Calcular peso (tiempo entre puntos)
+                peso = self._calculate_weight(pr, siguiente)
+                
+                # Agregar arista
+                nodo_siguiente = NodoTransporte(siguiente.punto_id, pr.ruta_id)
+                self._add_edge(nodo_actual, nodo_siguiente, peso)
+            
+            # Si es parada, considerar transferencias
+            punto = self.db.query(Punto).filter(Punto.id == pr.punto_id).first()
+            if punto and punto.stop:
+                transferencias = self.db.query(Transferencia).filter(
+                    Transferencia.punto_id == pr.punto_id,
+                    Transferencia.ruta_origen_id == pr.ruta_id
+                ).all()
+                
+                for trans in transferencias:
+                    nodo_destino = NodoTransporte(pr.punto_id, trans.ruta_destino_id)
+                    self._add_edge(nodo_actual, nodo_destino, trans.penalizacion_minutos)
+    
+    def _add_edge(self, origen: NodoTransporte, destino: NodoTransporte, peso: float):
+        """Agrega una arista al grafo"""
+        key = (origen.punto_id, origen.ruta_id)
+        if key not in self.graph:
+            self.graph[key] = []
+        self.graph[key].append((destino, peso))
+    
+    def _calculate_weight(self, punto1: LineaRutaPunto, punto2: LineaRutaPunto) -> float:
+        """
+        Calcula el peso entre dos puntos consecutivos en la misma ruta.
+        Usa el tiempo acumulado si está disponible, o calcula por distancia.
+        """
+        # Usar tiempo acumulado si existe
+        if punto2.tiempo_acumulado and punto1.tiempo_acumulado:
+            return float(punto2.tiempo_acumulado - punto1.tiempo_acumulado)
+        
+        # Si no, estimar basado en distancia
+        if punto2.distancia_acumulada and punto1.distancia_acumulada:
+            distancia = float(punto2.distancia_acumulada - punto1.distancia_acumulada)
+            # Asumir velocidad promedio de 20 km/h
+            velocidad_kmh = 20
+            tiempo_minutos = (distancia / 1000) / velocidad_kmh * 60
+            return tiempo_minutos
+        
+        return 1.0  # Peso default
+    
+    def _get_state_key(self, punto_id: int, ruta_id: Optional[int] = None) -> Tuple[int, Optional[int]]:
+        """Obtiene la clave de estado para Dijkstra"""
+        return (punto_id, ruta_id)
+    
+    def encontrar_ruta_optima(self, punto_origen_id: int, punto_destino_id: int, 
+                              max_rutas: int = 5) -> List[Dict]:
+        """
+        Encuentra las mejores rutas usando Dijkstra
+        
+        Args:
+            punto_origen_id: ID del punto de origen
+            punto_destino_id: ID del punto de destino
+            max_rutas: Numero maximo de rutas a retornar
+            
+        Returns:
+            Lista de rutas encontradas, cada una con pasos y tiempo total
+        """
+        # Obtener rutas que pasan por el origen
+        rutas_origen = self.db.query(LineaRutaPunto).filter(
+            LineaRutaPunto.punto_id == punto_origen_id
+        ).all()
+        
+        if not rutas_origen:
+            return []
+        
+        # Inicializar Dijkstra para cada posible ruta de origen
+        distancias = {}
+        previos = {}
+        cola = []
+        
+        # Estado inicial: para cada ruta que pasa por el origen
+        for ruta in rutas_origen:
+            estado = (punto_origen_id, ruta.ruta_id)
+            distancias[estado] = 0
+            heapq.heappush(cola, (0, estado))
+        
+        while cola:
+            dist_actual, (punto_id, ruta_id) = heapq.heappop(cola)
+            
+            if dist_actual > distancias.get((punto_id, ruta_id), float('inf')):
+                continue
+            
+            # Verificar si llegamos al destino
+            if punto_id == punto_destino_id:
+                break
+            
+            # Explorar vecinos
+            key = (punto_id, ruta_id)
+            for vecino, peso in self.graph.get(key, []):
+                nueva_dist = dist_actual + peso
+                estado_vecino = (vecino.punto_id, vecino.ruta_id)
+                
+                if nueva_dist < distancias.get(estado_vecino, float('inf')):
+                    distancias[estado_vecino] = nueva_dist
+                    previos[estado_vecino] = (punto_id, ruta_id)
+                    heapq.heappush(cola, (nueva_dist, estado_vecino))
+        
+        # Reconstruir las mejores rutas
+        resultados = []
+        
+        # Buscar estados de destino
+        destinos = [(k, v) for k, v in distancias.items() 
+                   if k[0] == punto_destino_id]
+        destinos.sort(key=lambda x: x[1])  # Ordenar por distancia
+        
+        # Tomar las primeras max_rutas
+        for (dest_id, ruta_dest_id), tiempo_total in destinos[:max_rutas]:
+            if tiempo_total == float('inf'):
+                continue
+                
+            pasos = self._reconstruir_camino(previos, 
+                                            (punto_origen_id, rutas_origen[0].ruta_id),
+                                            (dest_id, ruta_dest_id))
+            
+            resultado = {
+                'tiempo_total_minutos': round(tiempo_total, 2),
+                'pasos': pasos,
+                'informacion_detallada': self._get_detalle_ruta(pasos)
+            }
+            resultados.append(resultado)
+        
+        return resultados
+    
+    def _reconstruir_camino(self, previos: Dict, inicio: Tuple, fin: Tuple) -> List[Tuple]:
+        """Reconstruye el camino desde previos"""
+        camino = []
+        actual = fin
+        
+        while actual != inicio:
+            camino.append(actual)
+            if actual not in previos:
+                break
+            actual = previos[actual]
+        camino.append(inicio)
+        camino.reverse()
+        return camino
+    
+    def _get_detalle_ruta(self, pasos: List[Tuple]) -> List[Dict]:
+        """Obtiene información detallada de cada paso de la ruta"""
+        detalle = []
+        
+        for i, (punto_id, ruta_id) in enumerate(pasos):
+            punto = self.db.query(Punto).filter(Punto.id == punto_id).first()
+            ruta = self.db.query(Ruta).filter(Ruta.id == ruta_id).first()
+            
+            if punto and ruta:
+                detalle.append({
+                    'orden': i + 1,
+                    'punto_id': punto_id,
+                    'descripcion': punto.descripcion,
+                    'latitud': float(punto.geometria.y),
+                    'longitud': float(punto.geometria.x),
+                    'ruta_id': ruta_id,
+                    'nombre_linea': ruta.linea.nombre_linea if ruta.linea else None,
+                    'tipo_ruta': ruta.tipo_ruta,
+                    'es_transferencia': (i > 0 and ruta_id != pasos[i-1][1])
+                })
+        
+        return detalle
+    
+    def encontrar_puntos_cercanos(self, lat: float, lon: float, radio_metros: int = 200) -> List[Dict]:
+        """
+        Encuentra puntos de parada cercanos a una ubicación
+        
+        Args:
+            lat: Latitud
+            lon: Longitud
+            radio_metros: Radio de búsqueda en metros
+            
+        Returns:
+            Lista de puntos cercanos
+        """
+        # Convertir punto a geometría
+        point_wkt = f"POINT({lon} {lat})"
+        
+        # Buscar puntos dentro del radio
+        puntos = self.db.query(Punto).filter(
+            Punto.stop == True,
+            ST_Distance(
+                ST_Transform(Punto.geometria, 32720),  # UTM zona 20S (Santa Cruz)
+                ST_Transform(WKTElement(point_wkt, 4326), 32720)
+            ) <= radio_metros
+        ).all()
+        
+        resultados = []
+        for p in puntos:
+            resultados.append({
+                'id': p.id,
+                'descripcion': p.descripcion,
+                'latitud': float(p.geometria.y),
+                'longitud': float(p.geometria.x),
+                'lineas': self._get_lineas_punto(p.id)
+            })
+        
+        return resultados
+    
+    def _get_lineas_punto(self, punto_id: int) -> List[str]:
+        """Obtiene las líneas que pasan por un punto"""
+        rutas = self.db.query(LineaRutaPunto).filter(
+            LineaRutaPunto.punto_id == punto_id
+        ).all()
+        
+        lineas_nombres = set()
+        for ruta in rutas:
+            ruta_info = self.db.query(Ruta).filter(Ruta.id == ruta.ruta_id).first()
+            if ruta_info and ruta_info.linea:
+                lineas_nombres.add(ruta_info.linea.nombre_linea)
+        
+        return sorted(list(lineas_nombres))
