@@ -10,6 +10,7 @@ ENV/
 env.bak/
 venv.bak/
 pythonenv*
+.venv
 
 # Distribucion / Paquetes
 .Python
@@ -86,3 +87,6 @@ temp/
 # Archivos de sistema
 Thumbs.db
 desktop.ini
+
+# Gunicorn
+gunicorn.pid
