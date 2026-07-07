@@ -1,0 +1,22 @@
+# scripts/microruta.service
+[Unit]
+Description=MicroRuta Backend Service
+After=network.target postgresql.service
+
+[Service]
+Type=notify
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/backend_microruta
+Environment="PATH=/opt/backend_microruta/venv/bin"
+Environment="PYTHONPATH=/opt/backend_microruta"
+ExecStart=/opt/backend_microruta/venv/bin/gunicorn -c gunicorn.conf.py app.main:app
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=5
+PrivateTmp=true
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
