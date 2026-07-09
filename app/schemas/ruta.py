@@ -1,28 +1,3 @@
-"""
-from pydantic import BaseModel
-from typing import List, Optional
-
-class RutaPaso(BaseModel):
-    orden: int
-    punto_id: int
-    descripcion: str
-    latitud: float
-    longitud: float
-    ruta_id: int
-    nombre_linea: Optional[str]
-    tipo_ruta: str
-    es_transferencia: bool
-
-class RutaOptimaRequest(BaseModel):
-    origen_id: int
-    destino_id: int
-
-class RutaOptimaResponse(BaseModel):
-    tiempo_total_minutos: float
-    pasos: List[tuple]
-    informacion_detallada: List[RutaPaso]
-"""
-
 from pydantic import BaseModel
 from typing import List, Optional
 

@@ -1,18 +1,3 @@
-"""
-from pydantic import BaseModel
-from typing import Optional
-
-class PuntoResponse(BaseModel):
-    id: int
-    descripcion: Optional[str]
-    latitud: float
-    longitud: float
-    stop: bool
-    
-    class Config:
-        from_attributes = True
-"""
-
 from pydantic import BaseModel
 from typing import Optional, List
 

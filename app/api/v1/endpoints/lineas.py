@@ -1,26 +1,3 @@
-"""
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from typing import List
-from ....core.database import SessionLocal
-from ....models.linea import Linea
-
-router = APIRouter()
-
-# Dependencia para obtener la sesión de la base de datos
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-@router.get("/", response_model=List[dict])
-async def get_lineas(db: Session = Depends(get_db)):
-    lineas = db.query(Linea).all()
-    return lineas
-"""
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
