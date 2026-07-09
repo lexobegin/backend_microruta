@@ -158,11 +158,22 @@ async def calcular_plan_viaje(
             if paso['nombre_linea'] is not None
         ))
         
-        # Calcular distancia total (aproximada)
+        # Calcular distancia total usando diferencias de acumulado por cada ruta.
         distancia_total = 0
+        paso_anterior = None
         for paso in ruta['informacion_detallada']:
-            if paso.get('distancia_acumulada'):
-                distancia_total += paso['distancia_acumulada']
+            if (
+                paso_anterior
+                and paso['ruta_id'] == paso_anterior['ruta_id']
+                and paso.get('distancia_acumulada') is not None
+                and paso_anterior.get('distancia_acumulada') is not None
+            ):
+                distancia_total += max(
+                    paso['distancia_acumulada'] - paso_anterior['distancia_acumulada'],
+                    0,
+                )
+
+            paso_anterior = paso
         
         resultados.append({
             "plan": idx + 1,

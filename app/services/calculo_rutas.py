@@ -72,20 +72,23 @@ class CalculadorRutas:
     
     def _calculate_weight(self, punto1: LineaRutaPunto, punto2: LineaRutaPunto) -> float:
         """Calcula el peso entre dos puntos consecutivos"""
-        if punto2.tiempo_acumulado and punto1.tiempo_acumulado:
-            return float(punto2.tiempo_acumulado - punto1.tiempo_acumulado)
+        if punto2.tiempo_acumulado is not None and punto1.tiempo_acumulado is not None:
+            tiempo = float(punto2.tiempo_acumulado - punto1.tiempo_acumulado)
+            if tiempo > 0:
+                return tiempo
         
-        if punto2.distancia_acumulada and punto1.distancia_acumulada:
+        if punto2.distancia_acumulada is not None and punto1.distancia_acumulada is not None:
             distancia = float(punto2.distancia_acumulada - punto1.distancia_acumulada)
-            velocidad_kmh = 20
-            tiempo_minutos = (distancia / 1000) / velocidad_kmh * 60
-            return tiempo_minutos
+            if distancia > 0:
+                velocidad_kmh = 20
+                tiempo_minutos = (distancia / 1000) / velocidad_kmh * 60
+                return max(tiempo_minutos, 1.0)
         
         return 1.0
     
     def encontrar_ruta_optima(self, punto_origen_id: int, punto_destino_id: int, 
                               max_rutas: int = 5) -> List[Dict]:
-        """Encuentra las mejores rutas usando Dijkstra"""
+        """Encuentra las mejores rutas priorizando viajes directos y menor tiempo."""
         rutas_origen = self.db.query(LineaRutaPunto).filter(
             LineaRutaPunto.punto_id == punto_origen_id
         ).all()
@@ -93,6 +96,7 @@ class CalculadorRutas:
         if not rutas_origen:
             return []
         
+        resultados = self._encontrar_rutas_directas(punto_origen_id, punto_destino_id)
         distancias = {}
         previos = {}
         cola = []
@@ -108,9 +112,6 @@ class CalculadorRutas:
             if dist_actual > distancias.get((punto_id, ruta_id), float('inf')):
                 continue
             
-            if punto_id == punto_destino_id:
-                break
-            
             key = (punto_id, ruta_id)
             for vecino, peso in self.graph.get(key, []):
                 nueva_dist = dist_actual + peso
@@ -121,18 +122,27 @@ class CalculadorRutas:
                     previos[estado_vecino] = (punto_id, ruta_id)
                     heapq.heappush(cola, (nueva_dist, estado_vecino))
         
-        resultados = []
         destinos = [(k, v) for k, v in distancias.items() 
                    if k[0] == punto_destino_id]
         destinos.sort(key=lambda x: x[1])
         
-        for (dest_id, ruta_dest_id), tiempo_total in destinos[:max_rutas]:
+        rutas_existentes = {
+            tuple(resultado['pasos']) for resultado in resultados
+        }
+
+        for (dest_id, ruta_dest_id), tiempo_total in destinos:
             if tiempo_total == float('inf'):
                 continue
                 
-            pasos = self._reconstruir_camino(previos, 
-                                            (punto_origen_id, rutas_origen[0].ruta_id),
-                                            (dest_id, ruta_dest_id))
+            pasos = self._reconstruir_camino(previos, (dest_id, ruta_dest_id))
+            if not pasos or pasos[0][0] != punto_origen_id:
+                continue
+
+            pasos_key = tuple(pasos)
+            if pasos_key in rutas_existentes:
+                continue
+
+            rutas_existentes.add(pasos_key)
             
             resultado = {
                 'tiempo_total_minutos': round(tiempo_total, 2),
@@ -140,22 +150,88 @@ class CalculadorRutas:
                 'informacion_detallada': self._get_detalle_ruta(pasos)
             }
             resultados.append(resultado)
+
+        resultados.sort(
+            key=lambda ruta: (
+                self._contar_transferencias(ruta['pasos']),
+                ruta['tiempo_total_minutos'],
+            )
+        )
         
+        return resultados[:max_rutas]
+
+    def _encontrar_rutas_directas(self, punto_origen_id: int, punto_destino_id: int) -> List[Dict]:
+        """Busca viajes en una sola ruta antes de evaluar transbordos."""
+        origenes = self.db.query(LineaRutaPunto).filter(
+            LineaRutaPunto.punto_id == punto_origen_id
+        ).all()
+
+        resultados = []
+        for origen in origenes:
+            destino = self.db.query(LineaRutaPunto).filter(
+                LineaRutaPunto.ruta_id == origen.ruta_id,
+                LineaRutaPunto.punto_id == punto_destino_id,
+                LineaRutaPunto.orden > origen.orden,
+            ).first()
+
+            if not destino:
+                continue
+
+            puntos = self.db.query(LineaRutaPunto).filter(
+                LineaRutaPunto.ruta_id == origen.ruta_id,
+                LineaRutaPunto.orden >= origen.orden,
+                LineaRutaPunto.orden <= destino.orden,
+            ).order_by(LineaRutaPunto.orden).all()
+
+            pasos = [(punto.punto_id, punto.ruta_id) for punto in puntos]
+            tiempo_total = self._calcular_tiempo_tramo(origen, destino, puntos)
+
+            resultados.append({
+                'tiempo_total_minutos': round(tiempo_total, 2),
+                'pasos': pasos,
+                'informacion_detallada': self._get_detalle_ruta(pasos)
+            })
+
         return resultados
+
+    def _calcular_tiempo_tramo(
+        self,
+        origen: LineaRutaPunto,
+        destino: LineaRutaPunto,
+        puntos: List[LineaRutaPunto]
+    ) -> float:
+        """Calcula el tiempo de un tramo directo usando datos acumulados o pesos."""
+        if destino.tiempo_acumulado is not None and origen.tiempo_acumulado is not None:
+            tiempo = float(destino.tiempo_acumulado - origen.tiempo_acumulado)
+            if tiempo > 0:
+                return tiempo
+
+        tiempo_total = 0.0
+        for index in range(1, len(puntos)):
+            tiempo_total += self._calculate_weight(puntos[index - 1], puntos[index])
+
+        return tiempo_total if tiempo_total > 0 else 1.0
     
-    def _reconstruir_camino(self, previos: Dict, inicio: Tuple, fin: Tuple) -> List[Tuple]:
+    def _reconstruir_camino(self, previos: Dict, fin: Tuple) -> List[Tuple]:
         """Reconstruye el camino desde previos"""
         camino = []
         actual = fin
         
-        while actual != inicio:
+        while actual is not None:
             camino.append(actual)
             if actual not in previos:
                 break
             actual = previos[actual]
-        camino.append(inicio)
+
         camino.reverse()
         return camino
+
+    def _contar_transferencias(self, pasos: List[Tuple]) -> int:
+        return sum(
+            1
+            for index in range(1, len(pasos))
+            if pasos[index][1] != pasos[index - 1][1]
+        )
     
     def _get_detalle_ruta(self, pasos: List[Tuple]) -> List[Dict]:
         """Obtiene información detallada de cada paso de la ruta"""
@@ -164,6 +240,10 @@ class CalculadorRutas:
         for i, (punto_id, ruta_id) in enumerate(pasos):
             punto = self.db.query(Punto).filter(Punto.id == punto_id).first()
             ruta = self.db.query(Ruta).filter(Ruta.id == ruta_id).first()
+            punto_ruta = self.db.query(LineaRutaPunto).filter(
+                LineaRutaPunto.punto_id == punto_id,
+                LineaRutaPunto.ruta_id == ruta_id,
+            ).first()
             
             if punto and ruta:
                 geom = to_shape(punto.geometria)
@@ -178,7 +258,9 @@ class CalculadorRutas:
                     'nombre_linea': ruta.linea.nombre_linea if ruta.linea else None,
                     'tipo_ruta': ruta.tipo_ruta,
                     'es_transferencia': (i > 0 and ruta_id != pasos[i-1][1]),
-                    'stop': punto.stop
+                    'stop': punto.stop,
+                    'distancia_acumulada': float(punto_ruta.distancia_acumulada) if punto_ruta and punto_ruta.distancia_acumulada is not None else None,
+                    'tiempo_acumulado': float(punto_ruta.tiempo_acumulado) if punto_ruta and punto_ruta.tiempo_acumulado is not None else None,
                 })
         
         return detalle
